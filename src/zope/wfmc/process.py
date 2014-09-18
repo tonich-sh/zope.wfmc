@@ -366,14 +366,14 @@ class Activity(persistent.Persistent):
         if self.workitems:
             evaluator = getEvaluator(self.process)
             for workitem, app, formal, actual in self.workitems.values():
-                __traceback_info__ = (
-                    workitem, self.activity_definition_identifier)
+                # __traceback_info__ = (
+                #     workitem, self.activity_definition_identifier)
 
                 inputs = evaluateInputs(self.process, formal, actual, evaluator)
                 args = [a for n, a in inputs]
 
-                __traceback_info__ = (self.activity_definition_identifier,
-                                      workitem, args)
+                # __traceback_info__ = (self.activity_definition_identifier,
+                #                       workitem, args)
 
                 zope.event.notify(WorkItemStarting(workitem, app, actual))
 
@@ -563,7 +563,7 @@ class Process(persistent.Persistent):
             elif parameter.initialValue is not None:
                 arg = evaluator.evaluate(parameter.initialValue)
             else:
-                __traceback_info__ = (self, args, definition.parameters)
+                # __traceback_info__ = (self, args, definition.parameters)
                 raise ValueError(
                     'Insufficient arguments passed to process.')
             setattr(data, parameter.__name__, arg)
@@ -586,7 +586,7 @@ class Process(persistent.Persistent):
                 elif parameter.initialValue is not None:
                     value = evaluator.evaluate(parameter.initialValue)
                 else:
-                    __traceback_info__ = (self, parameter)
+                    # __traceback_info__ = (self, parameter)
                     raise ValueError('Output parameter not available.')
                 outputs.append(value)
 
@@ -732,7 +732,7 @@ def evaluateInputs(process, formal, actual, evaluator, strict=True):
     args = []
     for parameter, expr in zip(formal, actual):
         if parameter.input:
-            __traceback_info__ = (parameter, expr)
+            # __traceback_info__ = (parameter, expr)
             try:
                 value = evaluator.evaluate(expr)
             except:
@@ -946,9 +946,11 @@ class OutputParameter(Parameter):
 class InputParameter(Parameter):
     input = True
 
+
 class InputOutputParameter(InputParameter, OutputParameter):
 
     pass
+
 
 class Application:
 
@@ -1013,16 +1015,20 @@ class PythonExpressionEvaluator(object):
         self.process = process
 
     def evaluate(self, expr, locals={}):
-        __traceback_info__ = (expr, locals)
+        # __traceback_info__ = (expr, locals)
         ns = {'context': self.process.context}
+        self.process.workflowRelevantData._p_activate()
+        self.process.applicationRelevantData._p_activate()
         ns.update(vars(self.process.workflowRelevantData))
         ns.update(vars(self.process.applicationRelevantData))
         ns.update(locals)
         return eval(expr, ALLOWED_BUILTINS, ns)
 
     def execute(self, code, locals={}):
-        __traceback_info__ = (code, locals)
+        # __traceback_info__ = (code, locals)
         ns = {'context': self.process.context}
+        self.process.workflowRelevantData._p_activate()
+        self.process.applicationRelevantData._p_activate()
         ns.update(vars(self.process.workflowRelevantData))
         ns.update(vars(self.process.applicationRelevantData))
         ns.update(locals)
