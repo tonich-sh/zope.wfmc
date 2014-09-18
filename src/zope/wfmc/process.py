@@ -1208,6 +1208,8 @@ class PythonExpressionEvaluator(object):
     def evaluate(self, expr, locals={}):
         __traceback_info__ = (expr, locals)
         ns = {'context': self.process.context}
+        self.process.workflowRelevantData._p_activate()
+        self.process.applicationRelevantData._p_activate()
         ns.update(vars(self.process.workflowRelevantData))
         ns.update(vars(self.process.applicationRelevantData))
         ns.update(locals)
@@ -1216,6 +1218,8 @@ class PythonExpressionEvaluator(object):
     def execute(self, code, locals={}):
         __traceback_info__ = (code, locals)
         ns = {'context': self.process.context}
+        self.process.workflowRelevantData._p_activate()
+        self.process.applicationRelevantData._p_activate()
         ns.update(vars(self.process.workflowRelevantData))
         ns.update(vars(self.process.applicationRelevantData))
         ns.update(locals)
