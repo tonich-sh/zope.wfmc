@@ -303,7 +303,7 @@ class Activity(persistent.Persistent):
 
         # Didn't want to change the getter, but do want it set from the
         # constructor
-        self._definition = definition
+        self._p_definition = definition
 
         self.id = self.process.activityIdSequence.next()
         if hasattr(self, "definition") and \
@@ -400,7 +400,7 @@ class Activity(persistent.Persistent):
             return self.process.definition.activities[
                 self.activity_definition_identifier]
         except KeyError:
-            return self._definition
+            return self._p_definition
     definition = property(definition)
 
     def createScriptWorkItems(self):
@@ -647,7 +647,7 @@ class Process(persistent.Persistent):
     def __init__(self, definition, start, context=None):
         self.process_definition_identifier = definition.id
         self.context = context
-        self._definiton = definition
+        self._p_definiton = definition
         self.activities = {}
         self.finishedActivities = {}
         self.activityIdSequence = Sequence()
@@ -664,7 +664,7 @@ class Process(persistent.Persistent):
         try:
             return getProcessDefinition(self.process_definition_identifier)
         except zope.component.interfaces.ComponentLookupError:
-            return self._definiton
+            return self._p_definiton
 
     def start(self, *arguments):
         if self.isStarted:
