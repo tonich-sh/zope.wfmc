@@ -14,6 +14,7 @@
 """XPDL reader for process definitions
 """
 
+import logging
 import sys
 import xml.sax
 import xml.sax.xmlreader
@@ -24,6 +25,10 @@ from zope.wfmc import interfaces
 
 xpdlns10 = "http://www.wfmc.org/2002/XPDL1.0"
 xpdlns21 = "http://www.wfmc.org/2008/XPDL2.1"
+
+RAISE_ON_DUPLICATE_ERROR = False
+
+log = logging.getLogger(__name__)
 
 
 class HandlerError(Exception):
@@ -49,6 +54,7 @@ class Package(dict):
         self.applications = {}
         self.participants = {}
         self.script = None
+        self.parseErrors = []
 
     def defineApplications(self, **applications):
         for id, application in applications.items():
@@ -64,6 +70,23 @@ class Package(dict):
         self.script = script
 
 
+class DeadlineDefinition(object):
+    def __init__(self, duration, act_def, exceptionName=None,
+                 execution='SYNCHR'):
+        self.duration = duration
+        self.exceptionName = exceptionName
+        self.execution = execution
+
+        # The definition ID must be the list index, since there is no other
+        # uniquely identifying information (0 for the first, etc.)
+        self.id = len(act_def.deadlines)
+        if self.id > 0:
+            raise NotImplementedError(
+                'Current implementation only supports one deadline per activity'
+            )
+        act_def.deadlines.append(self)
+
+
 class XPDLHandler(xml.sax.handler.ContentHandler):
 
     start_handlers = {}
@@ -77,6 +100,7 @@ class XPDLHandler(xml.sax.handler.ContentHandler):
     ActivityDefinitionFactory = zope.wfmc.process.ActivityDefinition
     TransitionDefinitionFactory = zope.wfmc.process.TransitionDefinition
     TextCondition = zope.wfmc.process.TextCondition
+    DeadlineDefinitionFactory = DeadlineDefinition
 
     def __init__(self, package):
         self.package = package
@@ -236,15 +260,15 @@ class XPDLHandler(xml.sax.handler.ContentHandler):
     start_handlers[(xpdlns10, 'Activity')] = Activity
     start_handlers[(xpdlns21, 'Activity')] = Activity
 
-    def Tool(self, attrs):
+    def startTool(self, attrs):
         return Tool(attrs[(None, 'Id')])
-    start_handlers[(xpdlns10, 'Tool')] = Tool
-    start_handlers[(xpdlns21, 'TaskApplication')] = Tool
+    start_handlers[(xpdlns10, 'Tool')] = startTool
+    start_handlers[(xpdlns21, 'TaskApplication')] = startTool
 
-    def tool(self, tool):
+    def endTool(self, tool):
         self.stack[-1].addApplication(tool.id, tool.parameters)
-    end_handlers[(xpdlns10, 'Tool')] = tool
-    end_handlers[(xpdlns21, 'TaskApplication')] = tool
+    end_handlers[(xpdlns10, 'Tool')] = endTool
+    end_handlers[(xpdlns21, 'TaskApplication')] = endTool
 
     def SubFlow(self, attrs):
         return SubFlow(attrs[(None, 'Id')], attrs.get((None, 'Execution')))
@@ -283,7 +307,6 @@ class XPDLHandler(xml.sax.handler.ContentHandler):
 
     def performer(self, ignored):
         activity = self.stack[-1]
-
         if not isinstance(activity, zope.wfmc.process.ActivityDefinition):
             # We are not parsing activity yet (probably this is a performer
             # in a pool)
@@ -292,6 +315,26 @@ class XPDLHandler(xml.sax.handler.ContentHandler):
         self.stack[-1].definePerformer(self.text.strip())
     end_handlers[(xpdlns10, 'Performer')] = performer
     end_handlers[(xpdlns21, 'Performer')] = performer
+
+    def startDeadline(self, attrs):
+        execution = attrs.get((None, u'Execution')) or u'SYNCHR'
+        actdef = self.stack[-1]
+        self.DeadlineDefinitionFactory(
+            None, actdef, exceptionName=None, execution=execution)
+    start_handlers[(xpdlns10, 'Deadline')] = startDeadline
+    start_handlers[(xpdlns21, 'Deadline')] = startDeadline
+
+    def deadlineDuration(self, actdef):
+        duration = self.text.strip()
+        actdef.deadlines[-1].duration = duration
+    end_handlers[(xpdlns10, 'DeadlineDuration')] = deadlineDuration
+    end_handlers[(xpdlns21, 'DeadlineDuration')] = deadlineDuration
+
+    def exceptionName(self, actdef):
+        exceptionName = self.text.strip()
+        actdef.deadlines[-1].exceptionName = exceptionName
+    end_handlers[(xpdlns10, 'exceptionName')] = exceptionName
+    end_handlers[(xpdlns21, 'exceptionName')] = exceptionName
 
     def Join(self, attrs):
         Type = attrs.get((None, 'Type'))
@@ -332,7 +375,7 @@ class XPDLHandler(xml.sax.handler.ContentHandler):
     end_handlers[(xpdlns10, 'Transition')] = transition
     end_handlers[(xpdlns21, 'Transition')] = transition
 
-    def Condition(self, attrs):
+    def startCondition(self, attrs):
         tp = attrs.get((None, 'Type'), 'CONDITION')
         transdef = self.stack[-1]
         assert isinstance(transdef, self.TransitionDefinitionFactory)
@@ -340,18 +383,18 @@ class XPDLHandler(xml.sax.handler.ContentHandler):
         transdef.type = tp
         condition = self.TextCondition(tp)
         return condition
-    start_handlers[(xpdlns10, 'Condition')] = Condition
-    start_handlers[(xpdlns21, 'Condition')] = Condition
+    start_handlers[(xpdlns10, 'Condition')] = startCondition
+    start_handlers[(xpdlns21, 'Condition')] = startCondition
 
-    def condition(self, condition):
+    def endCondition(self, condition):
         assert isinstance(self.stack[-1],
                           self.TransitionDefinitionFactory)
 
         text = self.text
         condition.set_source('(%s)' % text)
         self.stack[-1].condition = condition
-    end_handlers[(xpdlns10, 'Condition')] = condition
-    end_handlers[(xpdlns21, 'Condition')] = condition
+    end_handlers[(xpdlns10, 'Condition')] = endCondition
+    end_handlers[(xpdlns21, 'Condition')] = endCondition
 
     def ExtendedAttributes(self, attrs):
         parent = self.stack[-1]
@@ -366,6 +409,14 @@ class XPDLHandler(xml.sax.handler.ContentHandler):
         container = self.stack[-1]
         name = attrs[(None, 'Name')]
         value = attrs.get((None, 'Value'))
+        if name in container:
+            msg = (u"The Name '{}' is already used, uniqueness violated, "
+                   u"value: '{}' see: {}.".format(
+                    name, value, self.package.id))
+            if RAISE_ON_DUPLICATE_ERROR:
+                raise KeyError(msg)
+            self.package.parseErrors.append(msg)
+
         container[name] = value
         return container, name
     start_handlers[(xpdlns10, 'ExtendedAttribute')] = ExtendedAttribute

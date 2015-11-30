@@ -25,7 +25,8 @@ from zope.wfmc import interfaces, process
 
 def tearDown(test):
     testing.tearDown(test)
-    zope.event.subscribers.pop()
+    if zope.event.subscribers:
+        zope.event.subscribers.pop()
 
 
 def setUp(test):
@@ -43,7 +44,7 @@ class WorkItemStub(object):
         self.process = process
         self.activity = activity
 
-    def start(self, *args):
+    def start(self, args):
         self.args = args
         print 'Workitem %i for activity %r started.' % (
             self.id, self.activity.definition.id)
@@ -114,7 +115,8 @@ def test_multiple_input_parameters():
     ...     def __init__(self, participant, process, activity):
     ...         self.participant = participant
     ...
-    ...     def start(self, x, y):
+    ...     def start(self, args):
+    ...         x = args['x']; y=args['y']
     ...         print x, y
 
 
@@ -202,8 +204,9 @@ def test_inputoutput():
     ...     def __init__(self, participant, process, activity):
     ...         self.participant = participant
     ...
-    ...     def start(self, x):
-    ...         self.participant.activity.workItemFinished(self, x+1)
+    ...     def start(self, args):
+    ...         x = args['x']
+    ...         self.participant.activity.workItemFinished(self, {'x': x+1 })
 
 
     >>> integration.eekWorkItem = Eek
@@ -289,10 +292,75 @@ def test_process_abort():
     """
 
 
+def test_getValidOutgoingTransitions():
+    """
+
+    >>> from zope.wfmc import process
+    >>> pd = process.ProcessDefinition('sample')
+    >>> from zope import component, interface
+
+    >>> pdfactory = process.StaticProcessDefinitionFactory()
+    >>> zope.component.provideUtility(pdfactory)
+    >>> pdfactory.register(pd)
+
+    >>> pd.defineActivities(
+    ...    eek = process.ActivityDefinition(),
+    ...    ook = process.ActivityDefinition(),
+    ...    )
+    >>> pd.defineTransitions(process.TransitionDefinition('eek', 'ook'))
+
+    >>> proc = pd()
+    >>> process.getValidOutgoingTransitions(proc, pd.activities['eek'])
+    [TransitionDefinition(from='eek', to='ook')]
+    """
+
+
+def test_getValidOutgoingTransitions_custom_checker():
+    """
+
+    >>> from zope.wfmc import process
+    >>> pd = process.ProcessDefinition('sample')
+    >>> from zope import component, interface
+
+    >>> pdfactory = process.StaticProcessDefinitionFactory()
+    >>> zope.component.provideUtility(pdfactory)
+    >>> pdfactory.register(pd)
+
+    >>> pd.defineActivities(
+    ...    eek = process.ActivityDefinition(),
+    ...    ook = process.ActivityDefinition(),
+    ...    )
+    >>> def raiseCondition(data):
+    ...     raise Exception()
+    >>> pd.defineTransitions(process.TransitionDefinition('eek', 'ook',
+    ...                      condition=raiseCondition))
+    >>> proc = pd()
+    >>> process.getValidOutgoingTransitions(proc, pd.activities['eek'])
+    Traceback (most recent call last):
+      ...
+        raise Exception()
+    Exception
+
+    >>> def swallowExceptionsChecker(transition):
+    ...     try:
+    ...         transition.condition(proc)
+    ...     except:
+    ...         return [transition]
+    ...     return []
+    ...
+
+    >>> process.getValidOutgoingTransitions(
+    ...     proc, pd.activities['eek'], checker=swallowExceptionsChecker)
+    [TransitionDefinition(from='eek', to='ook')]
+
+    """
+
+
 def test_suite():
     suite = unittest.TestSuite()
     for doctestfile in ['README.txt', 'xpdl.txt',
-                        'xpdl-2.1.txt', 'subflow.txt']:
+                        'xpdl-2.1.txt', 'subflow.txt',
+                        'deadline.txt']:
         suite.addTest(doctest.DocFileSuite(
             doctestfile,
             setUp=setUp, tearDown=tearDown,

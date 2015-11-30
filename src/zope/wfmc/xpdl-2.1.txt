@@ -6,6 +6,7 @@ Here we will demonstrate, that xpdl-2.1 files are also importable and works.
 For general description of how to work with XPDL files, refer xpdl.txt.
 
     >>> from zope.wfmc import xpdl
+    >>> xpdl.RAISE_ON_DUPLICATE_ERROR = True
     >>> import os
     >>> package = xpdl.read(open(os.path.join(this_directory,
     ...                                       'publication-2.1.xpdl')))
@@ -93,7 +94,7 @@ and we'll define and register participant and application adapters:
     ...         self.activity = participant.activity
     ...         participant.user.work_list.append(self)
     ...
-    ...     def start(self):
+    ...     def start(self, args):
     ...         pass
     ...
     ...     def finish(self):
@@ -125,25 +126,37 @@ and we'll define and register participant and application adapters:
     ...         return self.activity.process.applicationRelevantData.doc
     ...
     ...     def finish(self, decision, changes):
-    ...         self.activity.workItemFinished(self, decision, changes)
+    ...         output = {'publish': decision, 'tech_changes': changes}
+    ...         self.activity.workItemFinished(self, output)
 
     >>> integration.tech_reviewWorkItem = TechReview
 
     >>> class Review(TechReview):
     ...
-    ...     def start(self, publish1, changes1, publish2, changes2):
+    ...     def start(self, args):
+    ...         publish1 = args['publish1']
+    ...         publish2 = args['publish2']
+    ...         changes1 = args['tech_changes1']
+    ...         changes2 = args['tech_changes2']
     ...         if not (publish1 and publish2):
+    ...             output = {'publish': False,
+    ...                       'tech_changes': changes1 + changes2,
+    ...                       'ed_changes': ()}
     ...             # Reject if either tech reviewer rejects
     ...             self.activity.workItemFinished(
-    ...                 self, False, changes1 + changes2, ())
+    ...                 self, output)
     ...
     ...         if changes1 or changes2:
+    ...             output = {'publish': True,
+    ...                       'tech_changes': changes1 + changes2,
+    ...                       'ed_changes': ()}
     ...             # we won't do anyting if there are tech changes
     ...             self.activity.workItemFinished(
-    ...                 self, True, changes1 + changes2, ())
+    ...                 self, output)
     ...
     ...     def finish(self, ed_changes):
-    ...         self.activity.workItemFinished(self, True, (), ed_changes)
+    ...         output = {'publish': True, 'tech_changes': (), 'ed_changes': ed_changes}
+    ...         self.activity.workItemFinished(self, output)
 
     >>> integration.ed_reviewWorkItem = Review
 
@@ -167,7 +180,8 @@ and we'll define and register participant and application adapters:
     >>> class ReviewFinal(TechReview):
     ...
     ...     def finish(self, ed_changes):
-    ...         self.activity.workItemFinished(self, ed_changes)
+    ...         output = {'publish': True, 'tech_changes': (), 'ed_changes': ed_changes}
+    ...         self.activity.workItemFinished(self, output)
 
     >>> integration.rfinalWorkItem = ReviewFinal
 
@@ -179,7 +193,7 @@ and we'll define and register participant and application adapters:
     ...     def __init__(self, participant, process, activity):
     ...         self.participant = participant
     ...
-    ...     def start(self):
+    ...     def start(self, args):
     ...         print "Published"
     ...         self.finish()
     ...
@@ -434,3 +448,25 @@ Extended attributes are stored in ActivityDefinition.attributes dictionary
     OrderedDict([(u'ParticipantID', u'author'),
                  (u'XOffset', u'110'),
                  (u'YOffset', u'20')])
+
+Edge cases
+-----------
+
+Just in case there are duplicate ExtendedAttribute Names for a single
+ExtendedAttributes container, raise an error.
+Having two ExtendedAttribute elements is nonsense.
+
+    >>> fname = 'publication-2.1-duplicate-ExtendedAttribute.xpdl'
+    >>> package = xpdl.read(open(os.path.join(this_directory, fname))) # doctest: +ELLIPSIS
+    Traceback (most recent call last):
+    ...
+    HandlerError: u"The Name 'ParticipantID' is already used, uniqueness violated, value: 'system' see: Publication."
+    File ".../src/zope/wfmc/publication-2.1-duplicate-ExtendedAttribute.xpdl", line 240. in ExtendedAttribute
+
+Sometimes we can't always raise an exception when this happens so instead
+we can record the parse error.
+    >>> xpdl.RAISE_ON_DUPLICATE_ERROR = False
+    >>> package = xpdl.read(open(os.path.join(this_directory, fname)))
+    >>> package.parseErrors
+    [u"The Name 'ParticipantID' is already used, uniqueness violated, value: 'system' see: Publication."]
+    

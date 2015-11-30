@@ -14,8 +14,11 @@
 """Processes
 """
 import logging
-
+import threading
+import copy
 import persistent
+import datetime
+from datetime import timedelta
 import zope.cachedescriptors.property
 import zope.event
 from collections import OrderedDict
@@ -31,6 +34,22 @@ DEL_MARKER = "WFRD_DEL_MARK_"
 
 def always_true(data):
     return True
+
+
+def defaultDeadlineTimer(process, deadline):
+    timestamp = deadline.deadline_time
+    timer = threading.Timer(
+        (timestamp - datetime.datetime.now()).seconds,
+        process.deadlinePassedHandler,
+        args=[deadline]
+    )
+    deadline.deadlineTimer = timer
+    timer.start()
+
+
+def defaultDeadlineCanceller(process, deadline):
+    if deadline.deadlineTimer:
+        deadline.deadlineTimer.cancel()
 
 
 class StaticProcessDefinitionFactory(object):
@@ -67,7 +86,7 @@ class TransitionDefinition(object):
         return self.type in ('OTHERWISE', )
 
     def __repr__(self):
-        return "TransitionDefinition(from=%r, to=%r)" %(self.from_, self.to)
+        return "TransitionDefinition(from=%r, to=%r)" % (self.from_, self.to)
 
 
 class ProcessDefinition(object):
@@ -208,6 +227,7 @@ class ActivityDefinition(object):
         self.description = None
         self.attributes = OrderedDict()
         self.event = None
+        self.deadlines = []
 
     def andSplit(self, setting):
         self.andSplitSetting = setting
@@ -255,23 +275,96 @@ class ActivityDefinition(object):
             self.outgoing = self.transition_outgoing
 
     def __repr__(self):
-        return "<ActivityDefinition %r>" %self.__name__
+        return "<ActivityDefinition %r>" % self.__name__
+
+
+class Deadline(object):
+    def __init__(self, activity, deadline_time, deadlinedef):
+        self.activity = activity
+        self.deadline_time = deadline_time
+        self.definition = deadlinedef
+        if deadlinedef.execution != u'SYNCHR':
+            raise NotImplementedError('Only Synchronous (SYNCHR) deadlines '
+                                      'are supported at this point.')
 
 
 class Activity(persistent.Persistent):
     interface.implements(interfaces.IActivity)
+    DeadlineFactory = Deadline
 
     incoming = ()
+    deadlineTimer = None
 
     def __init__(self, process, definition):
         self.process = process
         self.activity_definition_identifier = definition.id
-        self.workitems = None
+        self.workitems = {}
         self.finishedWorkitems = {}
+
+        # Didn't want to change the getter, but do want it set from the
+        # constructor
+        self._p_definition = definition
+
+        self.id = self.process.activityIdSequence.next()
         if hasattr(self, "definition") and \
                 self.definition.andJoinSetting and \
                 not self.process.has_join_revert_data(self.definition):
             self.process.set_join_revert_data(self.definition, 0)
+
+        self.deadlines = []
+        for deadlinedef in self.definition.deadlines:
+            evaluator = interfaces.IPythonExpressionEvaluator(self.process)
+            if not deadlinedef.duration:
+                log.warn('There is an empty deadline time in '
+                          '{} for activity {}.'.format(process, definition.id))
+                continue
+            try:
+                evaled = evaluator.evaluate(deadlinedef.duration,
+                                            {'timedelta': timedelta,
+                                             'datetime': datetime})
+            except Exception as e:
+                raise RuntimeError(
+                    'Evaluating the deadline duration failed '
+                    'for activity {}. Error: {}'.format(definition.id, e))
+
+            if evaled is None:
+                log.warn('There is an empty deadline time in '
+                          '{} for activity {}.'.format(process, definition.id))
+                continue
+
+            if isinstance(evaled, timedelta):
+                deadline_time = datetime.datetime.now() + evaled
+            elif isinstance(evaled, datetime.datetime):
+                deadline_time = evaled
+            elif isinstance(evaled, int):
+                deadline_time = datetime.datetime.now() + \
+                    timedelta(seconds=evaled)
+            else:
+                raise ValueError(
+                    'Deadline time was not a timedelta, datetime, or integer '
+                    'number of seconds.\n{}'.format(evaled)
+                )
+
+            deadline = self.DeadlineFactory(self, deadline_time, deadlinedef)
+            self.deadlines.append(deadline)
+            self.process.deadlineTimer(deadline)
+        self.createWorkItems()
+
+    @property
+    def activity_definition_identifier_path(self):
+        path = (self.process.process_definition_identifier + '.' +
+                self.activity_definition_identifier)
+        # We are only handling subflows.
+        if self.process.starterActivityId is not None:
+            try:
+                starterActivity = self.process.activities[
+                    self.process.starterActivityId]
+            except KeyError:
+                starterActivity = self.process.finishedActivities[
+                    self.process.starterActivityId]
+            path = (starterActivity.activity_definition_identifier_path +
+                    '.' + path)
+        return path
 
     def createWorkItems(self):
         workitems = {}
@@ -301,6 +394,14 @@ class Activity(persistent.Persistent):
             workitems[i] = workitem, application, formal, actual
 
         return workitems
+
+    def definition(self):
+        try:
+            return self.process.definition.activities[
+                self.activity_definition_identifier]
+        except KeyError:
+            return self._p_definition
+    definition = property(definition)
 
     def createScriptWorkItems(self):
         integration = self.process.definition.integration
@@ -335,16 +436,10 @@ class Activity(persistent.Persistent):
 
         return workitems
 
-    def definition(self):
-        return self.process.definition.activities[
-            self.activity_definition_identifier]
-    definition = property(definition)
-
     def start(self, transition):
         # Start the activity, if we've had enough incoming transitions
 
         definition = self.definition
-
         if definition.andJoinSetting:
             if transition in self.incoming:
                 raise interfaces.ProcessError(
@@ -370,14 +465,13 @@ class Activity(persistent.Persistent):
                 #     workitem, self.activity_definition_identifier)
 
                 inputs = evaluateInputs(self.process, formal, actual, evaluator)
-                args = [a for n, a in inputs]
+                args = {n: a for n, a in inputs}
 
                 # __traceback_info__ = (self.activity_definition_identifier,
                 #                       workitem, args)
 
                 zope.event.notify(WorkItemStarting(workitem, app, actual))
-
-                workitem.start(*args)
+                workitem.start(args)
 
         else:
             # Since we don't have any work items, we're done
@@ -391,23 +485,35 @@ class Activity(persistent.Persistent):
         if not self.workitems:
             self.finish()
 
-    def workItemFinished(self, work_item, *results):
-        unused, app, formal, actual = entry = self.workitems.pop(work_item.id)
+    def workItemFinished(self, work_item, results=None):
+        try:
+            unused, app, formal, actual = entry = \
+                self.workitems.pop(work_item.id)
+        except KeyError:
+            raise KeyError(
+                'Tried to pop workitem id:{} from the workitems dict of {}. '
+                'Maybe it is already finished: {}'.format(
+                    work_item.id, self, self.finishedWorkitems))
         self.finishedWorkitems[work_item.id] = entry
         self._p_changed = True
-        res = results
-        outputs = [(param, name) for param, name in zip(formal, actual)
-                   if param.output]
-        if len(res) != len(outputs):
-            formalnames = tuple([p.__name__ for p, a in outputs])
-            raise TypeError("Not enough parameters returned by work "
-                            "item. Expected: %s, got: %s" % (formalnames,
-                                                             results))
+        args = results
+        if not results:
+            args = {}
+
+        res = []
 
         for parameter, name in zip(formal, actual):
             if parameter.output:
-                v = res[0]
-                res = res[1:]
+                __traceback_info__ = args, parameter
+                v = args.get(parameter.__name__)
+                res.append(v)
+
+                if not name:
+                    log.warning("Output parameter {param} of {activity} "
+                                "is not bound to workflow variables".format(
+                                    param=parameter, activity=self))
+                    continue
+
                 # Remember the old value to restore in case of revert
                 try:
                     old_val = getattr(self.process.workflowRelevantData, name)
@@ -419,11 +525,8 @@ class Activity(persistent.Persistent):
                             old_val)
                 setattr(self.process.workflowRelevantData, name, v)
 
-        if res:
-            raise TypeError("Too many results")
-
         zope.event.notify(WorkItemFinished(
-            work_item, app, actual, results))
+            work_item, app, actual, res))
 
         if not self.workitems:
             self.finish()
@@ -437,13 +540,15 @@ class Activity(persistent.Persistent):
         transitions = getValidOutgoingTransitions(self.process, self.definition)
 
         self.process.transition(self, transitions)
+        for deadline in self.deadlines:
+            self.process.deadlineCanceller(deadline)
 
         if self.definition.andJoinSetting:
             self.process.set_join_revert_data(self.definition, 0)
 
-    def abort(self):
+    def abort(self, cancelDeadlineTimer=True):
         # Revert all finished workitems first
-        self.revert()
+        self.revert(cancelDeadlineTimer=cancelDeadlineTimer)
 
         # Join activites abortion should result in waiting next time
         if self.definition.andJoinSetting:
@@ -457,30 +562,45 @@ class Activity(persistent.Persistent):
         # Remove itself from the process activities list.
         del self.process.activities[self.id]
 
-    def revert(self):
+    def restoreWFRD(self):
+        wf_revert_names = [name for name in dir(self.process.applicationRelevantData)
+                           if name.startswith(WFRD_PREFIX+str(self.id)+"_")]
+        for name in wf_revert_names:
+            old_val = getattr(self.process.applicationRelevantData, name)
+            wfname = name.lstrip(WFRD_PREFIX+str(self.id)+"_")
+            if old_val == DEL_MARKER:
+                delattr(self.process.workflowRelevantData, wfname)
+            else:
+                setattr(self.process.workflowRelevantData, wfname, old_val)
 
+    def revert(self, cancelDeadlineTimer=True):
+
+        reverted_workitems = []
         # Revert all finished workitems.
         for workitem, app, formal, actual in self.finishedWorkitems.values():
             if interfaces.IRevertableWorkItem.providedBy(workitem):
                 workitem.revert()
+                reverted_workitems.append(workitem)
 
             # Restore workflowRelevantData
-            wf_revert_names = [name for name in dir(self.process.applicationRelevantData)
-                               if name.startswith(WFRD_PREFIX+str(self.id)+"_")]
-            for name in wf_revert_names:
-                old_val = getattr(self.process.applicationRelevantData, name)
-                wfname = name.lstrip(WFRD_PREFIX+str(self.id)+"_")
-                if old_val == DEL_MARKER:
-                    delattr(self.process.workflowRelevantData, wfname)
-                else:
-                    setattr(self.process.workflowRelevantData, wfname, old_val)
+            self.restoreWFRD()
+
+        if cancelDeadlineTimer:
+            for deadline in self.deadlines:
+                self.process.deadlineCanceller(deadline)
 
         # Join activites should not have to wait next time you visit them
         # after a true revert
         if self.definition.andJoinSetting:
-            new_num = self.process.get_join_revert_data(self.definition) + 1
+            # the new activity must be one less then the number of in
+            # activities since the number of reverts can not be smaller
+            # then the 1 minus the number of in because the activity is
+            # removed from the map.
+            new_num = len(self.definition.incoming) - 1
             self.process.set_join_revert_data(self.definition, new_num)
         zope.event.notify(ActivityReverted(self))
+
+        return reverted_workitems
 
     def __repr__(self):
         return "Activity(%r)" % (
@@ -521,9 +641,13 @@ class Process(persistent.Persistent):
     starterActivityId = None
     starterWorkitemId = None
 
+    deadlineTimer = defaultDeadlineTimer
+    deadlineCanceller = defaultDeadlineCanceller
+
     def __init__(self, definition, start, context=None):
         self.process_definition_identifier = definition.id
         self.context = context
+        self._p_definiton = definition
         self.activities = {}
         self.finishedActivities = {}
         self.activityIdSequence = Sequence()
@@ -537,7 +661,10 @@ class Process(persistent.Persistent):
 
     @property
     def definition(self):
-        return getProcessDefinition(self.process_definition_identifier)
+        try:
+            return getProcessDefinition(self.process_definition_identifier)
+        except zope.component.interfaces.ComponentLookupError:
+            return self._p_definiton
 
     def start(self, *arguments):
         if self.isStarted:
@@ -576,7 +703,7 @@ class Process(persistent.Persistent):
         self.transition(None, (self.startTransition, ))
 
     def outputs(self):
-        outputs = []
+        outputs = {}
         evaluator = interfaces.IPythonExpressionEvaluator(self)
         for parameter in self.definition.parameters:
             if parameter.output:
@@ -586,9 +713,11 @@ class Process(persistent.Persistent):
                 elif parameter.initialValue is not None:
                     value = evaluator.evaluate(parameter.initialValue)
                 else:
-                    # __traceback_info__ = (self, parameter)
-                    raise ValueError('Output parameter not available.')
-                outputs.append(value)
+                    __traceback_info__ = (self, parameter)
+                    raise ValueError('Process finished, and there is an output '
+                                     'parameter with no value in workflow vars '
+                                     'and no initial value.')
+                outputs[parameter.__name__] = value
 
         return outputs
 
@@ -598,19 +727,19 @@ class Process(persistent.Persistent):
             # Subflow finished, continue with main flow
             starter = self.activities[self.starterActivityId]
             wi, _, _, _ = starter.workitems[self.starterWorkitemId]
-            starter.workItemFinished(wi, *self.outputs())
+            starter.workItemFinished(wi, self.outputs())
         else:
             zope.event.notify(ProcessFinished(self))
 
     def abort(self):
-        for activity in sorted(self.activities.values(),
+        allActivities = self.activities.values() + self.finishedActivities.values()
+        for activity in sorted(allActivities,
                                key=Process.chronological_key,
                                reverse=True):
-            activity.abort()
-        for activity in sorted(self.finishedActivities.values(),
-                               key=Process.chronological_key,
-                               reverse=True):
-            activity.revert()
+            if activity.id in self.activities:
+                activity.abort()
+            else:
+                activity.revert()
         self.isAborted = True
         zope.event.notify(ProcessAborted(self))
 
@@ -631,8 +760,6 @@ class Process(persistent.Persistent):
 
                 if next is None:
                     next = self.ActivityFactory(self, activity_definition)
-                    next.createWorkItems()
-                    next.id = self.activityIdSequence.next()
 
                 zope.event.notify(Transition(activity, next))
                 self.activities[next.id] = next
@@ -688,6 +815,26 @@ class Process(persistent.Persistent):
         """
         return activity.id
 
+    def deadlinePassedHandler(self, deadline):
+        # TODO: Is this threadsafe?
+        if deadline.definition.execution != u'SYNCHR':
+            raise NotImplementedError('Only Synchronous (SYNCHR) deadlines are '
+                                      'supported at this piont.')
+        activity = deadline.activity
+        activity.abort(cancelDeadlineTimer=False)
+        self.finishedActivities[activity.id] = activity
+        transitions = getValidOutgoingTransitions(
+            self, activity.definition,
+            exception=True
+        )
+
+        # activity.process, since self could be parent flow and we need local
+        # flow in case of subflow
+        activity.process.transition(activity, transitions)
+
+        if activity.definition.andJoinSetting:
+            self.set_join_revert_data(activity.definition, 0)
+
 
 class ProcessStarted:
     interface.implements(interfaces.IProcessStarted)
@@ -732,7 +879,9 @@ def evaluateInputs(process, formal, actual, evaluator, strict=True):
     args = []
     for parameter, expr in zip(formal, actual):
         if parameter.input:
-            # __traceback_info__ = (parameter, expr)
+            if expr is u'':
+                expr = getattr(parameter, 'initialValue', '')
+            __traceback_info__ = (parameter, expr)
             try:
                 value = evaluator.evaluate(expr)
             except:
@@ -745,7 +894,8 @@ def evaluateInputs(process, formal, actual, evaluator, strict=True):
     return args
 
 
-def getValidOutgoingTransitions(process, activity_definition, strict=True):
+def getValidOutgoingTransitions(process, activity_definition, exception=False,
+                                checker=None):
     """Return list of valid outgoing transitions from given activity_definition
     in given process.
 
@@ -756,23 +906,36 @@ def getValidOutgoingTransitions(process, activity_definition, strict=True):
     If any exception is raised during evaluation of condition expressions,
     it will be rerised only if ``strict`` parameter is True. Otherwise, the
     condition will be treated as False.
+
+    A custom checker can be passed in if the caller wants more control over
+    what gets raised during evaluation of the condition. The checker should
+    take a transition and return a boolean if the transition is available.
     """
+    def defaultChecker(transition):
+        return transition.condition(process)
+
+    if checker is None:
+        checker = defaultChecker
     transitions = []
     otherwises = []
+
+    if exception:
+        # TODO: Need support for exception Name specification
+        for transition in activity_definition.outgoing:
+            if transition.type == u'DEFAULTEXCEPTION':
+                return [transition]
+        else:
+            raise interfaces.ProcessError(
+                'The activity_definition {} exited with an exception, but no '
+                'exception transition was found.'.format(activity_definition)
+            )
 
     for transition in activity_definition.outgoing:
         if transition.otherwise:
             # do not consider 'otherwise' transitions just yet
             otherwises.append(transition)
             continue
-        try:
-            active = transition.condition(process)
-        except:
-            if strict:
-                raise
-            else:
-                active = False
-        if active:
+        if checker(transition):
             transitions.append(transition)
             if not activity_definition.andSplitSetting:
                 break  # xor split, want first one
@@ -786,7 +949,8 @@ def getValidOutgoingTransitions(process, activity_definition, strict=True):
 
 @zope.interface.implementer(interfaces.IWorkItem)
 class ScriptWorkItem(object):
-    "Executes the script and stores all changed workflow-relevant attributes."
+    """Executes the script and stores all changed workflow-relevant
+    attributes."""
 
     def __init__(self, process, activity, code):
         self.process = process
@@ -797,7 +961,7 @@ class ScriptWorkItem(object):
         evaluator = interfaces.IPythonExpressionEvaluator(self.process)
         evaluator.execute(self.code)
 
-    def start(self):
+    def start(self, args):
         self.execute()
         self.finish()
 
@@ -815,11 +979,13 @@ class SubflowWorkItem(object):
         self.subflow = subflow
         self.execution = execution
 
-    def start(self, *args):
+    def start(self, args):
         subproc = self.process.initSubflow(self.subflow,
                                            self.activity.id, self.id,
                                            proc_factory=self.processFactory)
-        subproc.start(*args)
+        pd = subproc.definition
+        tupArgs = [args.get(p.__name__, None) for p in pd.parameters if p.input]
+        subproc.start(*tupArgs)
 
 
 class WorkItemFinished(object):
@@ -876,6 +1042,7 @@ class Transition:
     def __repr__(self):
         return "Transition(%r, %r)" % (self.from_, self.to)
 
+
 class TextCondition:
 
     def __init__(self, type='CONDITION', source=''):
@@ -897,6 +1064,7 @@ class TextCondition:
     def __call__(self, process, data={}):
         evaluator = interfaces.IPythonExpressionEvaluator(process)
         return evaluator.evaluate(self.source, data)
+
 
 class ActivityFinished:
 

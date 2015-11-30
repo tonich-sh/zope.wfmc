@@ -254,7 +254,7 @@ Now we'll define our work-items. First we'll define some classes:
     ...         self.participant = participant
     ...         work_list.append(self)
     ...
-    ...     def start(self):
+    ...     def start(self, args):
     ...         pass
     ...
     ...     def finish(self):
@@ -262,15 +262,16 @@ Now we'll define our work-items. First we'll define some classes:
 
     >>> class Review(ApplicationBase):
     ...     def finish(self, publish):
-    ...         self.participant.activity.workItemFinished(self, publish)
+    ...         output = {'publish': publish}
+    ...         self.participant.activity.workItemFinished(self, output)
 
     >>> class Publish(ApplicationBase):
-    ...     def start(self):
+    ...     def start(self, args):
     ...         print "Published"
     ...         self.finish()
 
     >>> class Reject(ApplicationBase):
-    ...     def start(self):
+    ...     def start(self, args):
     ...         print "Rejected"
     ...         self.finish()
 
@@ -795,7 +796,7 @@ Now we'll create our applications. Let's start with our author:
     ...         self.activity = participant.activity
     ...         participant.user.work_list.append(self)
     ...
-    ...     def start(self):
+    ...     def start(self, args):
     ...         pass
     ...
     ...     def finish(self):
@@ -838,7 +839,8 @@ control.
     ...         return self.activity.process.applicationRelevantData.doc
     ...
     ...     def finish(self, decision, changes):
-    ...         self.activity.workItemFinished(self, decision, changes)
+    ...         output = {'publish': decision, 'tech_changes': changes}
+    ...         self.activity.workItemFinished(self, output)
 
     >>> integration.tech_reviewWorkItem = TechReview
 
@@ -846,19 +848,30 @@ Here, we provided a method to access the original document.
 
     >>> class Review(TechReview):
     ...
-    ...     def start(self, publish1, changes1, publish2, changes2):
+    ...     def start(self, args):
+    ...         publish1 = args['publish1']
+    ...         publish2 = args['publish2']
+    ...         changes1 = args['tech_changes1']
+    ...         changes2 = args['tech_changes2']
     ...         if not (publish1 and publish2):
+    ...             output = {'publish': False, 
+    ...                       'tech_changes': changes1 + changes2, 
+    ...                       'ed_changes': ()}
     ...             # Reject if either tech reviewer rejects
     ...             self.activity.workItemFinished(
-    ...                 self, False, changes1 + changes2, ())
+    ...                 self, output)
     ...
     ...         if changes1 or changes2:
+    ...             output = {'publish': True, 
+    ...                       'tech_changes': changes1 + changes2, 
+    ...                       'ed_changes': ()}
     ...             # we won't do anything if there are tech changes
     ...             self.activity.workItemFinished(
-    ...                 self, True, changes1 + changes2, ())
+    ...                 self, output)
     ...
     ...     def finish(self, ed_changes):
-    ...         self.activity.workItemFinished(self, True, (), ed_changes)
+    ...         output = {'publish': True, 'tech_changes': (), 'ed_changes': ed_changes}
+    ...         self.activity.workItemFinished(self, output)
 
     >>> integration.ed_reviewWorkItem = Review
 
@@ -893,7 +906,8 @@ changes.
     >>> class ReviewFinal(TechReview):
     ...
     ...     def finish(self, ed_changes):
-    ...         self.activity.workItemFinished(self, ed_changes)
+    ...         output = {'ed_changes': ed_changes}
+    ...         self.activity.workItemFinished(self, output)
 
     >>> integration.rfinalWorkItem = ReviewFinal
 
