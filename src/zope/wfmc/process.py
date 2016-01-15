@@ -218,8 +218,10 @@ class ActivityDefinition(object):
 
     def __init__(self, __name__=None):
         self.__name__ = __name__
-        self.incoming = self.outgoing = ()
-        self.transition_outgoing = self.explicit_outgoing = ()
+        self.incoming = ()
+        self.outgoing = ()
+        self.transition_outgoing = ()
+        self.explicit_outgoing = ()
         self.applications = ()
         self.subflows = ()
         self.scripts = ()
@@ -1055,7 +1057,11 @@ class TextCondition:
     def set_source(self, source):
         self.source = source
         # make sure that we can compile the source
-        compile(source, '<string>', 'eval')
+        try:
+            compile(source, '<string>', 'eval')
+        except SyntaxError, e:
+            log.error('\n%s\n%s^' % (e.text, ' ' * (e.offset - 1)))
+            raise
 
     def __getstate__(self):
         return {'source': self.source,
@@ -1183,7 +1189,6 @@ class PythonExpressionEvaluator(object):
         self.process = process
 
     def evaluate(self, expr, locals={}):
-        # __traceback_info__ = (expr, locals)
         ns = {'context': self.process.context}
         self.process.workflowRelevantData._p_activate()
         self.process.applicationRelevantData._p_activate()
@@ -1193,7 +1198,6 @@ class PythonExpressionEvaluator(object):
         return eval(expr, ALLOWED_BUILTINS, ns)
 
     def execute(self, code, locals={}):
-        # __traceback_info__ = (code, locals)
         ns = {'context': self.process.context}
         self.process.workflowRelevantData._p_activate()
         self.process.applicationRelevantData._p_activate()
@@ -1202,9 +1206,7 @@ class PythonExpressionEvaluator(object):
         ns.update(locals)
         ns.update(ALLOWED_BUILTINS)
         result = {}
-        exec code in ALLOWED_BUILTINS, result
-        for name, value in result:
-            pass
+        exec(code, ns, result)
 
 
 def getProcessDefinition(name):
