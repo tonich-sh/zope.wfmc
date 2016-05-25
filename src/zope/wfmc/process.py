@@ -1219,7 +1219,11 @@ class PythonExpressionEvaluator(object):
         ns.update(vars(self.process.workflowRelevantData))
         ns.update(vars(self.process.applicationRelevantData))
         ns.update(locals)
-        return eval(expr, ALLOWED_BUILTINS, ns)
+        try:
+            return eval(expr, ALLOWED_BUILTINS, ns)
+        except:
+            log.error(expr)
+            raise
 
     def execute(self, code, locals={}):
         __traceback_info__ = (code, locals)
