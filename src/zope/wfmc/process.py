@@ -32,10 +32,6 @@ WFRD_PREFIX = "WFRD_REVERT_"
 DEL_MARKER = "WFRD_DEL_MARK_"
 
 
-def always_true(data):
-    return True
-
-
 def defaultDeadlineTimer(process, deadline):
     timestamp = deadline.deadline_time
     timer = threading.Timer(
@@ -67,11 +63,17 @@ class StaticProcessDefinitionFactory(object):
         self.definitions[pd.id] = pd
 
 
+class AlwaysTrueCondition(object):
+
+    def __call__(self, *args, **kwargs):
+        return True
+
+
 class TransitionDefinition(object):
 
     interface.implements(interfaces.ITransitionDefinition)
 
-    def __init__(self, from_, to, condition=always_true, id=None,
+    def __init__(self, from_, to, condition=AlwaysTrueCondition(), id=None,
                  __name__=None, otherwise=False):
         self.id = id
         self.from_ = from_
@@ -441,7 +443,8 @@ class Activity(persistent.Persistent):
                     "Repeated incoming %s with id='%s' "
                     "while waiting for and completion"
                     % (transition, transition.id))
-            self.incoming += (transition, )
+            if transition is not None:
+                self.incoming += (transition, )
             if self.process.get_join_revert_data(self.definition) + \
                     len(self.incoming) < len(definition.incoming):
                 # Tells us whether or not we need to wait
