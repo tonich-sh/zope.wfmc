@@ -304,6 +304,8 @@ class Activity(persistent.Persistent):
         self.activity_definition_identifier = definition.id
         self.workitems = {}
         self.finishedWorkitems = {}
+        self.workitemIdSequence = Sequence()
+        self.active = True
 
         # Didn't want to change the getter, but do want it set from the
         # constructor
@@ -352,23 +354,25 @@ class Activity(persistent.Persistent):
             deadline = self.DeadlineFactory(self, deadline_time, deadlinedef)
             self.deadlines.append(deadline)
             self.process.deadlineTimer(deadline)
+
+        self.activity_definition_identifier_path = \
+            calculateActivityStackPath(self)
         self.createWorkItems()
 
-    @property
-    def activity_definition_identifier_path(self):
-        path = (self.process.process_definition_identifier + '.' +
-                self.activity_definition_identifier)
-        # We are only handling subflows.
-        if self.process.starterActivityId is not None:
-            try:
-                starterActivity = self.process.activities[
-                    self.process.starterActivityId]
-            except KeyError:
-                starterActivity = self.process.finishedActivities[
-                    self.process.starterActivityId]
-            path = (starterActivity.activity_definition_identifier_path +
-                    '.' + path)
-        return path
+    def getExecutionStack(self):
+        """Return list of subflow activities that eventually started the
+        process of current activity.
+
+        The first activity returned by this function will belong to the main
+        process.
+        """
+        act = self
+        stack = []
+        while act.process.starterActivityId:
+            act = self.process.activities[act.process.starterActivityId]
+            stack.append(act)
+        stack.reverse()
+        return stack
 
     def createWorkItems(self):
         workitems = {}
@@ -380,24 +384,24 @@ class Activity(persistent.Persistent):
         elif self.definition.scripts:
             workitems = self.createScriptWorkItems()
 
-        self.workitems = workitems
+        for workitem, application, formal, actual in workitems:
+            self.addWorkItem(workitem, application, formal, actual)
+
+    def addWorkItem(self, workitem, application, formal, actual):
+        nextid = self.workitemIdSequence.next()
+        workitem.id = nextid
+        self.workitems[nextid] = (workitem, application, formal, actual)
 
     def createApplicationWorkItems(self):
         integration = self.process.definition.integration
-        workitems = {}
 
         participant = integration.createParticipant(
             self, self.process, self.definition.performer)
-        i = 0
         # Instantiate Applications
         for application, formal, actual in self.definition.applications:
             workitem = integration.createWorkItem(
                 participant, self.process, self, application)
-            i += 1
-            workitem.id = i
-            workitems[i] = workitem, application, formal, actual
-
-        return workitems
+            yield workitem, application, formal, actual
 
     def definition(self):
         try:
@@ -409,49 +413,36 @@ class Activity(persistent.Persistent):
 
     def createScriptWorkItems(self):
         integration = self.process.definition.integration
-        workitems = {}
 
-        i = 0
         for code in self.definition.scripts:
             workitem = integration.createScriptWorkItem(
                 self.process, self, code)
-            i += 1
-            workitem.id = i
-            workitems[i] = workitem, "__script__", (), ()
-
-        return workitems
+            yield workitem, "__script__", (), ()
 
     def createSubflowWorkItems(self):
         integration = self.process.definition.integration
-        workitems = {}
-        i = 0
+
         # Instantiate Subflows
         for subflow, execution, actual in self.definition.subflows:
             # Figre out formal parameters. At this point, process definition
             # has to be available.
-            subflow_pd = getProcessDefinition(subflow)
+            subflow_pd = self.process.getSubflowProcessDefinition(subflow)
             formal = subflow_pd.parameters
 
             workitem = integration.createSubflowWorkItem(
                 self.process, self, subflow, execution)
-            i += 1
-            workitem.id = i
-            workitems[i] = workitem, subflow, formal, actual
-
-        return workitems
+            yield workitem, subflow, formal, actual
 
     def start(self, transition):
         # Start the activity, if we've had enough incoming transitions
 
         definition = self.definition
-        if definition.andJoinSetting:
+        if definition.andJoinSetting and transition is not None:
             if transition in self.incoming:
                 raise interfaces.ProcessError(
                     "Repeated incoming %s with id='%s' "
                     "while waiting for and completion"
                     % (transition, transition.id))
-            if transition is not None:
-                self.incoming += (transition, )
             if self.process.get_join_revert_data(self.definition) + \
                     len(self.incoming) < len(definition.incoming):
                 # Tells us whether or not we need to wait
@@ -477,6 +468,7 @@ class Activity(persistent.Persistent):
 
                 zope.event.notify(WorkItemStarting(workitem, app, actual))
                 workitem.start(args)
+                zope.event.notify(WorkItemStarted(workitem, app, actual))
 
         else:
             # Since we don't have any work items, we're done
@@ -538,8 +530,7 @@ class Activity(persistent.Persistent):
 
     def finish(self):
         proc = self.process
-        del proc.activities[self.id]
-        proc.finishedActivities[self.id] = self
+        self.active = False
         zope.event.notify(ActivityFinished(self))
 
         transitions = getValidOutgoingTransitions(self.process, self.definition)
@@ -552,9 +543,11 @@ class Activity(persistent.Persistent):
             self.process.set_join_revert_data(self.definition, 0)
 
     def abort(self, cancelDeadlineTimer=True):
+
         # Revert all finished workitems first
         self.revert(cancelDeadlineTimer=cancelDeadlineTimer)
 
+        self.active = False
         # Join activites abortion should result in waiting next time
         if self.definition.andJoinSetting:
             self.process.set_join_revert_data(self.definition, 0)
@@ -564,8 +557,11 @@ class Activity(persistent.Persistent):
             if interfaces.IAbortWorkItem.providedBy(workitem):
                 workitem.abort()
                 zope.event.notify(WorkItemAborted(workitem, app, actual))
-        # Remove itself from the process activities list.
-        del self.process.activities[self.id]
+            else:
+                # Just discard the workitem (we cannot abort it)
+                zope.event.notify(WorkItemDiscarded(workitem, app, actual))
+            del self.workitems[workitem.id]
+
 
     def restoreWFRD(self):
         wf_revert_names = [name for name in dir(self.process.applicationRelevantData)
@@ -633,6 +629,16 @@ class Sequence(object):
         return self.counter
 
 
+class ActivityContainer(dict):
+    interface.implements(interfaces.IActivityContainer)
+
+    def getActive(self):
+        return [a for a in self.values() if a.active]
+
+    def getFinished(self):
+        return [a for a in self.values() if not a.active]
+
+
 class Process(persistent.Persistent):
 
     interface.implements(interfaces.IProcess)
@@ -653,8 +659,7 @@ class Process(persistent.Persistent):
         self.process_definition_identifier = definition.id
         self.context = context
         self._p_definiton = definition
-        self.activities = {}
-        self.finishedActivities = {}
+        self.activities = ActivityContainer()
         self.activityIdSequence = Sequence()
         self.workflowRelevantData = self.WorkflowDataFactory()
         self.applicationRelevantData = self.WorkflowDataFactory()
@@ -737,12 +742,14 @@ class Process(persistent.Persistent):
             zope.event.notify(ProcessFinished(self))
 
     def abort(self):
-        allActivities = self.activities.values() + self.finishedActivities.values()
+        allActivities = self.activities.values()
         for activity in sorted(allActivities,
                                key=Process.chronological_key,
                                reverse=True):
-            if activity.id in self.activities:
+            if activity.active:
                 activity.abort()
+                # Remove activity from the process activities list.
+                del self.activities[activity.id]
             else:
                 activity.revert()
         self.isAborted = True
@@ -757,7 +764,9 @@ class Process(persistent.Persistent):
                 next = None
                 if activity_definition.andJoinSetting:
                     # If it's an and-join, we want only one.
-                    for i, a in self.activities.items():
+                    for a in self.activities.getActive():
+                        if a.process is not activity.process:
+                            continue
                         if a.activity_definition_identifier == transition.to:
                             # we already have the activity -- use it
                             next = a
@@ -777,12 +786,14 @@ class Process(persistent.Persistent):
     def __repr__(self):
         return "Process(%r)" % self.process_definition_identifier
 
-    def initSubflow(self, subflow_pd_id, starter_activity_id,
+    def getSubflowProcessDefinition(self, subflow_pd_name):
+        return getProcessDefinition(subflow_pd_name)
+
+    def initSubflow(self, subflow_pd_name, starter_activity_id,
                     starter_workitem_id, proc_factory=None):
-        subflow_pd = getProcessDefinition(subflow_pd_id)
+        subflow_pd = self.getSubflowProcessDefinition(subflow_pd_name)
         subflow = subflow_pd(self.context, factory=proc_factory)
         subflow.activities = self.activities
-        subflow.finishedActivities = self.finishedActivities
         subflow.activityIdSequence = self.activityIdSequence
         subflow.subflows = self.subflows
 
@@ -827,7 +838,6 @@ class Process(persistent.Persistent):
                                       'supported at this piont.')
         activity = deadline.activity
         activity.abort(cancelDeadlineTimer=False)
-        self.finishedActivities[activity.id] = activity
         transitions = getValidOutgoingTransitions(
             self, activity.definition,
             exception=True
@@ -1017,6 +1027,17 @@ class WorkItemStarting(object):
         return "WorkItemStarting(%r)" % self.application
 
 
+class WorkItemStarted(object):
+    """Event emitted just after starting a workitem"""
+    def __init__(self, workitem, application, parameters):
+        self.workitem = workitem
+        self.application = application
+        self.parameters = parameters
+
+    def __repr__(self):
+        return "WorkItemStarted(%r)" % self.application
+
+
 class WorkItemAborted:
 
     def __init__(self, workitem, application, parameters):
@@ -1131,10 +1152,12 @@ class InputOutputParameter(InputParameter, OutputParameter):
 
 class Application:
 
-    interface.implements(interfaces.IApplicationDefinition)
+    interface.implements(interfaces.IApplicationDefinition,
+                         interfaces.IExtendedAttributesContainer)
 
     def __init__(self, *parameters):
         self.parameters = parameters
+        self.attributes = OrderedDict()
 
     def defineParameters(self, *parameters):
         self.parameters += parameters
@@ -1223,3 +1246,18 @@ def getProcessDefinition(name):
     if pd is None:
         raise RuntimeError("Process with name %s is not found" % name)
     return pd
+
+
+def getActivityStackPath(activity_defs):
+    """Return path of activity definition stack (as a string)
+    """
+    return "/".join("%s@%s" % (ad.process.id, ad.id) for ad in activity_defs)
+
+
+def calculateActivityStackPath(activity):
+    if activity.definition is None:
+        return None
+    stack = activity.getExecutionStack()
+    ads = [a.definition for a in stack if a.definition]
+    ads.append(activity.definition)
+    return getActivityStackPath(ads)
