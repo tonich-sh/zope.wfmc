@@ -439,12 +439,12 @@ class Activity(persistent.Persistent):
 
         definition = self.definition
         if definition.andJoinSetting and transition is not None:
-            if transition in self.incoming:
-                raise interfaces.ProcessError(
-                    "Repeated incoming %s with id='%s' "
-                    "while waiting for and completion"
-                    % (transition, transition.id))
-            self.incoming += (transition, )
+            if transition not in self.incoming:
+                # raise interfaces.ProcessError(
+                #     "Repeated incoming %s with id='%s' "
+                #     "while waiting for and completion"
+                #     % (transition, transition.id))
+                self.incoming += (transition, )
             if self.process.get_join_revert_data(self.definition) + \
                     len(self.incoming) < len(definition.incoming):
                 # Tells us whether or not we need to wait
