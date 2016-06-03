@@ -630,16 +630,6 @@ class Sequence(object):
         return self.counter
 
 
-class ActivityContainer(persistent.mapping.PersistentMapping):
-    interface.implements(interfaces.IActivityContainer)
-
-    def getActive(self):
-        return [a for a in self.values() if a.active]
-
-    def getFinished(self):
-        return [a for a in self.values() if not a.active]
-
-
 class Process(persistent.Persistent):
 
     interface.implements(interfaces.IProcess)
@@ -660,7 +650,7 @@ class Process(persistent.Persistent):
         self.process_definition_identifier = definition.id
         self.context = context
         self._p_definiton = definition
-        self.activities = ActivityContainer()
+        self.activities = {}
         self.activityIdSequence = Sequence()
         self.workflowRelevantData = self.WorkflowDataFactory()
         self.applicationRelevantData = self.WorkflowDataFactory()
@@ -676,6 +666,12 @@ class Process(persistent.Persistent):
             return getProcessDefinition(self.process_definition_identifier)
         except zope.component.interfaces.ComponentLookupError:
             return self._p_definiton
+
+    def getActiveActivities(self):
+        return [a for a in self.activities.values() if a.active]
+
+    def getFinishedActivities(self):
+        return [a for a in self.activities.values() if not a.active]
 
     def start(self, *arguments):
         if self.isStarted:
@@ -765,7 +761,7 @@ class Process(persistent.Persistent):
                 next = None
                 if activity_definition.andJoinSetting:
                     # If it's an and-join, we want only one.
-                    for a in self.activities.getActive():
+                    for a in self.getActiveActivities():
                         if a.process is not activity.process:
                             continue
                         if a.activity_definition_identifier == transition.to:
