@@ -17,6 +17,7 @@ import logging
 import threading
 import copy
 import persistent
+import persistent.mapping
 import datetime
 from datetime import timedelta
 import zope.cachedescriptors.property
@@ -454,17 +455,19 @@ class Activity(persistent.Persistent):
 
         zope.event.notify(ActivityStarted(self))
 
-        if self.workitems:
+        if len(self.workitems) != len(self.finishedWorkitems):
             evaluator = getEvaluator(self.process)
             for workitem, app, formal, actual in self.workitems.values():
-                # __traceback_info__ = (
-                #     workitem, self.activity_definition_identifier)
+                if workitem.id in self.finishedWorkitems:
+                    continue
+                __traceback_info__ = (
+                    workitem, self.activity_definition_identifier)
 
                 inputs = evaluateInputs(self.process, formal, actual, evaluator)
                 args = {n: a for n, a in inputs}
 
-                # __traceback_info__ = (self.activity_definition_identifier,
-                #                       workitem, args)
+                __traceback_info__ = (self.activity_definition_identifier,
+                                      workitem, args)
 
                 zope.event.notify(WorkItemStarting(workitem, app, actual))
                 workitem.start(args)
@@ -475,7 +478,7 @@ class Activity(persistent.Persistent):
             self.finish()
 
     def workItemDiscarded(self, work_item):
-        unused, app, formal, actual = self.workitems.pop(work_item.id)
+        unused, app, formal, actual = self.workitems[work_item.id]
         self._p_changed = True
         zope.event.notify(WorkItemDiscarded(work_item, app, actual))
 
@@ -483,22 +486,18 @@ class Activity(persistent.Persistent):
             self.finish()
 
     def workItemFinished(self, work_item, results=None):
-        try:
-            unused, app, formal, actual = entry = \
-                self.workitems.pop(work_item.id)
-        except KeyError:
+        if work_item.id in self.finishedWorkitems:
             raise KeyError(
-                'Tried to pop workitem id:{} from the workitems dict of {}. '
-                'Maybe it is already finished: {}'.format(
+                'WorkItem it is already finished: {}'.format(
                     work_item.id, self, self.finishedWorkitems))
-        self.finishedWorkitems[work_item.id] = entry
+        self.finishedWorkitems[work_item.id] = 'finished'
         self._p_changed = True
         args = results
         if not results:
             args = {}
 
         res = []
-
+        _, app, formal, actual = self.workitems[work_item.id]
         for parameter, name in zip(formal, actual):
             if parameter.output:
                 __traceback_info__ = args, parameter
@@ -525,11 +524,10 @@ class Activity(persistent.Persistent):
         zope.event.notify(WorkItemFinished(
             work_item, app, actual, res))
 
-        if not self.workitems:
+        if len(self.finishedWorkitems) == len(self.workitems):
             self.finish()
 
     def finish(self):
-        proc = self.process
         self.active = False
         zope.event.notify(ActivityFinished(self))
 
@@ -541,6 +539,8 @@ class Activity(persistent.Persistent):
 
         if self.definition.andJoinSetting:
             self.process.set_join_revert_data(self.definition, 0)
+        # needed for implement WF cycles
+        self.finishedWorkitems = {}
 
     def abort(self, cancelDeadlineTimer=True):
 
@@ -560,8 +560,7 @@ class Activity(persistent.Persistent):
             else:
                 # Just discard the workitem (we cannot abort it)
                 zope.event.notify(WorkItemDiscarded(workitem, app, actual))
-            del self.workitems[workitem.id]
-
+        self.finishedWorkitems = {}
 
     def restoreWFRD(self):
         wf_revert_names = [name for name in dir(self.process.applicationRelevantData)
@@ -578,7 +577,10 @@ class Activity(persistent.Persistent):
 
         reverted_workitems = []
         # Revert all finished workitems.
-        for workitem, app, formal, actual in self.finishedWorkitems.values():
+        for workitem_id, finish_status in self.finishedWorkitems.items():
+            if finish_status == 'discardred':
+                continue
+            workitem, app, formal, actual = self.workitems[workitem_id]
             if interfaces.IRevertableWorkItem.providedBy(workitem):
                 workitem.revert()
                 reverted_workitems.append(workitem)
@@ -629,7 +631,7 @@ class Sequence(object):
         return self.counter
 
 
-class ActivityContainer(dict):
+class ActivityContainer(persistent.mapping.PersistentMapping):
     interface.implements(interfaces.IActivityContainer)
 
     def getActive(self):
