@@ -444,6 +444,7 @@ class Activity(persistent.Persistent):
                     "Repeated incoming %s with id='%s' "
                     "while waiting for and completion"
                     % (transition, transition.id))
+            self.incoming += (transition, )
             if self.process.get_join_revert_data(self.definition) + \
                     len(self.incoming) < len(definition.incoming):
                 # Tells us whether or not we need to wait
@@ -539,8 +540,6 @@ class Activity(persistent.Persistent):
 
         if self.definition.andJoinSetting:
             self.process.set_join_revert_data(self.definition, 0)
-        # needed for implement WF cycles
-        self.finishedWorkitems = {}
 
     def abort(self, cancelDeadlineTimer=True):
 
@@ -776,7 +775,6 @@ class Process(persistent.Persistent):
 
                 if next is None:
                     next = self.ActivityFactory(self, activity_definition)
-
                 zope.event.notify(Transition(activity, next))
                 self.activities[next.id] = next
                 next.start(transition)

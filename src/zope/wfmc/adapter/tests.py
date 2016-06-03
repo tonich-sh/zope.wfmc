@@ -16,7 +16,7 @@
 import unittest
 import zope.event
 from zope.component import testing, provideAdapter
-from zope.testing import doctest
+import doctest
 
 from zope.wfmc import process
 
