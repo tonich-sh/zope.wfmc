@@ -773,6 +773,7 @@ class Process(persistent.Persistent):
                     next = self.ActivityFactory(self, activity_definition)
                 zope.event.notify(Transition(activity, next))
                 self.activities[next.id] = next
+                self._p_changed = True  # set it here to prevent data loss at intermediate transaction.commit()
                 next.start(transition)
         else:
             self._finish()
